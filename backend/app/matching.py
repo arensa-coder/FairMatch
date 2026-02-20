@@ -1,75 +1,91 @@
 """
-FairMatch scoring algorithm (Section 6 of the spec).
+FairMatch scoring algorithm.
 
-Weights:
-  Skills       30%
-  Commute      25%
-  Experience   15%
-  Certifications 10%
-  Schedule     10%
-  Industry     10%
+Factor weights
+--------------
+  Skills        55%  — primary/required factor
+  Commute       20%  — nice-to-have
+  Salary/Hours  15%  — nice-to-have
+  Interest      10%  — nice-to-have (preferred-industry alignment)
 
-Returns a 0–100 integer score plus a factor breakdown dict.
-Matches below 60 are suppressed from candidate views.
+All four factors contribute to the 0-100 composite score.
+``required_skills_met`` in the result flags whether the candidate holds
+every skill marked ``is_required=True`` on the posting.
+
+Matches are never suppressed by score — every job is shown to candidates,
+ordered by score descending.  The old MATCH_THRESHOLD constant has been
+removed.
 """
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from app.models.candidate import (
-        CandidateSkill,
-        CandidateWorkHistory,
-        CandidateCertification,
-        CandidatePreference,
-    )
+    from app.models.candidate import CandidateSkill, CandidatePreference
     from app.models.job import JobPosting, JobRequiredSkill
 
-MATCH_THRESHOLD = 60  # Only show matches at or above this score
-
-# ── Experience level mapping to approximate years ────────────────────────────
-_EXP_MIDPOINTS: dict[str, int] = {
-    "entry-level": 0,
-    "1-3 years":   2,
-    "3-5 years":   4,
-    "5+ years":    7,
-    "10+ years":  12,
+# ── Wage normalisation to approximate annual salary ──────────────────────────
+_TO_ANNUAL: dict[str, float] = {
+    "hourly":  2080.0,   # 40 h/wk × 52 wk
+    "weekly":  52.0,
+    "monthly": 12.0,
+    "annual":  1.0,
 }
 
-# ── Industry relatedness (a simplified adjacency map) ────────────────────────
+
+def _to_annual_salary(amount: Decimal | float, measurement: str) -> float:
+    """Convert a wage amount to an approximate annual figure."""
+    factor = _TO_ANNUAL.get(measurement.lower(), 1.0)
+    return float(amount) * factor
+
+
+# ── Industry relatedness map ──────────────────────────────────────────────────
 _RELATED_INDUSTRIES: dict[str, set[str]] = {
-    "construction": {"manufacturing", "trades", "maintenance"},
-    "healthcare":   {"nursing", "medical", "social_services"},
-    "retail":       {"sales", "hospitality", "customer_service"},
-    "hospitality":  {"food_service", "retail", "tourism"},
-    "manufacturing":{"construction", "logistics", "trades"},
-    "nonprofit":    {"social_services", "education", "government"},
+    "construction":  {"manufacturing", "trades", "maintenance"},
+    "healthcare":    {"nursing", "medical", "social_services"},
+    "retail":        {"sales", "hospitality", "customer_service"},
+    "hospitality":   {"food_service", "retail", "tourism"},
+    "manufacturing": {"construction", "logistics", "trades"},
+    "nonprofit":     {"social_services", "education", "government"},
 }
 
+
+# ── Scoring sub-functions ─────────────────────────────────────────────────────
 
 def _skills_score(
     candidate_skills: list["CandidateSkill"],
     required_skills: list["JobRequiredSkill"],
-) -> float:
+) -> tuple[float, bool]:
     """
-    (Candidate skills ∩ Job requirements) / Total required skills.
-    Required skills weighted 2×, preferred 1×.
+    Returns ``(ratio, required_skills_met)``.
+
+    ratio
+        Weighted proportion of job skills the candidate satisfies.
+        Required skills (``is_required=True``) count 2× ; preferred count 1×.
+
+    required_skills_met
+        True only when every ``is_required`` skill is present on the candidate.
     """
     if not required_skills:
-        return 1.0
+        return 1.0, True
 
-    candidate_skill_names = {s.skill_name.lower() for s in candidate_skills}
+    candidate_names = {s.skill_name.lower() for s in candidate_skills}
 
     total_weight = 0.0
     matched_weight = 0.0
+    all_required_met = True
 
     for rs in required_skills:
         weight = 2.0 if rs.is_required else 1.0
         total_weight += weight
-        if rs.skill_name.lower() in candidate_skill_names:
+        if rs.skill_name.lower() in candidate_names:
             matched_weight += weight
+        elif rs.is_required:
+            all_required_met = False
 
-    return matched_weight / total_weight if total_weight else 0.0
+    ratio = matched_weight / total_weight if total_weight else 0.0
+    return ratio, all_required_met
 
 
 def _commute_score(
@@ -77,129 +93,104 @@ def _commute_score(
     job: "JobPosting",
 ) -> float:
     """
-    Returns 1.0 if location type is remote (no commute needed).
-    For on-site/hybrid, a placeholder score is used; real implementation
-    would call a mapping API (Google Maps Distance Matrix) to get actual
-    commute time, then scale linearly against candidate's max preference.
+    1.0 for remote jobs (no commute needed).
+    Placeholder 0.5 for on-site/hybrid; Phase 2 will call the
+    Google Maps Distance Matrix API against ``candidate_pref.max_commute_*``.
     """
-    if job.location_type == "remote":
+    if getattr(job, "location_type", None) == "remote":
         return 1.0
-
-    if candidate_pref is None:
-        return 0.5  # No preference set → neutral score
-
-    # Placeholder: without address geocoding we return a neutral score.
-    # Phase 2 will integrate Google Maps Distance Matrix API here.
-    return 0.5
+    return 0.5  # Neutral until geocoding is available
 
 
-def _experience_score(
-    work_history: list["CandidateWorkHistory"],
+def _salary_hours_score(
+    candidate_pref: "CandidatePreference | None",
     job: "JobPosting",
 ) -> float:
     """
-    Estimates candidate's total years of experience from work history,
-    then compares against the job's experience_level requirement.
+    Average of two sub-scores: salary fit and hours fit.
+    Returns 0.5 (neutral) when either side has no data.
+
+    Salary
+        Job's wage range normalised to annual and compared against the
+        candidate's ``min_salary`` / ``max_salary`` preference (assumed annual).
+        - Within range → 1.0
+        - Above max    → 1.0 (earning more than desired is fine)
+        - Below min    → scaled down proportionally
+
+    Hours
+        ``job.hours_per_week`` compared against ``preferred_schedule``.
+        - "full-time" preference → 1.0 for ≥ 35 h/wk, scales to 0 below
+        - "part-time"/"flexible" → 1.0 for ≤ 30 h/wk, scales to 0 above 40
     """
-    if not job.experience_level:
-        return 1.0  # No requirement → full score
+    parts: list[float] = []
 
-    # Sum months of work history to get total years
-    from datetime import date as dt_date
+    # ── Salary component ──────────────────────────────────────────────────────
+    cand_min = getattr(candidate_pref, "min_salary", None)
+    cand_max = getattr(candidate_pref, "max_salary", None)
+    job_wage_min = getattr(job, "wage_min", None)
 
-    total_months = 0
-    today = dt_date.today()
-    for wh in work_history:
-        end = wh.end_date or today
-        delta = (end.year - wh.start_date.year) * 12 + (end.month - wh.start_date.month)
-        total_months += max(delta, 0)
-    candidate_years = total_months / 12
+    if (cand_min is not None or cand_max is not None) and job_wage_min is not None:
+        job_annual_min = _to_annual_salary(job.wage_min, job.wage_measurement)
+        raw_max = getattr(job, "wage_max", None) or job.wage_min
+        job_annual_max = _to_annual_salary(raw_max, job.wage_measurement)
+        job_mid = (job_annual_min + job_annual_max) / 2
 
-    required_years = _EXP_MIDPOINTS.get(job.experience_level.lower(), 0)
+        lo = float(cand_min) if cand_min is not None else 0.0
+        hi = float(cand_max) if cand_max is not None else float("inf")
 
-    if candidate_years >= required_years:
-        # Slight penalty for being heavily overqualified (>2× required)
-        if required_years > 0 and candidate_years > required_years * 2:
-            return 0.8
-        return 1.0
+        if lo <= job_mid <= hi:
+            parts.append(1.0)
+        elif job_mid < lo:
+            gap_ratio = (lo - job_mid) / lo if lo > 0 else 0.0
+            parts.append(max(0.0, 1.0 - gap_ratio))
+        else:
+            # Pays more than candidate's maximum preference — not a problem
+            parts.append(1.0)
 
-    # Underqualified: scale down proportionally
-    if required_years == 0:
-        return 1.0
-    ratio = candidate_years / required_years
-    return max(ratio, 0.0)
+    # ── Hours component ───────────────────────────────────────────────────────
+    preferred_schedule = getattr(candidate_pref, "preferred_schedule", None)
+    hours = getattr(job, "hours_per_week", None)
+
+    if preferred_schedule and hours is not None:
+        preferred = preferred_schedule.lower()
+        if any(t in preferred for t in ("full-time", "full time", "40")):
+            hours_score = 1.0 if hours >= 35 else max(0.0, hours / 35)
+        elif any(t in preferred for t in ("part-time", "part time", "flexible")):
+            hours_score = 1.0 if hours <= 30 else max(0.0, (40 - hours) / 10)
+        else:
+            hours_score = 0.5
+        parts.append(hours_score)
+
+    return sum(parts) / len(parts) if parts else 0.5
 
 
-def _certifications_score(
-    candidate_certs: list["CandidateCertification"],
+def _interest_score(
+    candidate_pref: "CandidatePreference | None",
     job: "JobPosting",
 ) -> float:
     """
-    Binary: 1.0 if candidate holds all required certifications, 0.0 if any missing.
-    Bonus: partial credit if no certs required (candidate's extras don't hurt).
+    Compares ``candidate_pref.preferred_industries`` (list of strings) against
+    ``job.sector``.
+
+    - Direct match  → 1.0
+    - Related sector → 0.5
+    - No match       → 0.0
+    - Missing data   → 0.5 (neutral)
     """
-    required = job.certifications_required or []
-    if not required:
-        return 1.0
+    preferred = getattr(candidate_pref, "preferred_industries", None)
+    sector = getattr(job, "sector", None)
 
-    candidate_cert_names = {c.certification_name.lower() for c in candidate_certs}
-    missing = [r for r in required if r.lower() not in candidate_cert_names]
-    return 0.0 if missing else 1.0
+    if not preferred or not sector:
+        return 0.5  # No preference data → neutral
 
+    preferred_set = {i.lower() for i in preferred}
+    job_sector = sector.lower()
 
-def _schedule_score(
-    pref: "CandidatePreference | None",
-    job: "JobPosting",
-) -> float:
-    """
-    Matches candidate's preferred schedule against the job's contract_type.
-    Exact match = 1.0, partial = 0.5, mismatch = 0.0.
-    """
-    if pref is None or not pref.preferred_schedule:
-        return 0.5  # No preference → neutral
-
-    preferred = pref.preferred_schedule.lower()
-    contract = job.contract_type.lower()
-
-    # Simple keyword matching; full NLP comparison is a Phase 2 improvement
-    if preferred in contract or contract in preferred:
-        return 1.0
-    # Partial overlaps
-    full_time_terms = {"full-time", "full time", "40 hours"}
-    part_time_terms = {"part-time", "part time", "flexible"}
-    if any(t in preferred for t in full_time_terms) and "full" in contract:
-        return 1.0
-    if any(t in preferred for t in part_time_terms) and "part" in contract:
-        return 1.0
-    return 0.0
-
-
-def _industry_score(
-    work_history: list["CandidateWorkHistory"],
-    job: "JobPosting",
-) -> float:
-    """
-    Checks if candidate's previous industries align with the job's sector.
-    Same = 1.0, related = 0.5, no match = 0.0.
-    """
-    if not job.sector:
-        return 0.5
-
-    job_sector = job.sector.lower()
-    # In a real system, work history rows would have an industry field.
-    # For now, we do a simple keyword search in company/title descriptions.
-    candidate_industries: set[str] = set()
-    for wh in work_history:
-        text = f"{wh.company} {wh.title} {wh.description or ''}".lower()
-        for keyword in _RELATED_INDUSTRIES:
-            if keyword in text:
-                candidate_industries.add(keyword)
-
-    if job_sector in candidate_industries:
+    if job_sector in preferred_set:
         return 1.0
 
     related = _RELATED_INDUSTRIES.get(job_sector, set())
-    if candidate_industries & related:
+    if preferred_set & related:
         return 0.5
 
     return 0.0
@@ -209,51 +200,59 @@ def _industry_score(
 
 def calculate_match_score(
     candidate_skills: list,
-    candidate_work_history: list,
-    candidate_certifications: list,
     candidate_pref: object | None,
     job: "JobPosting",
 ) -> dict:
     """
     Calculate the composite match score for a candidate↔job pair.
 
-    Returns:
+    Parameters
+    ----------
+    candidate_skills
+        List of ``CandidateSkill`` ORM objects (or duck-typed equivalents).
+    candidate_pref
+        ``CandidatePreference`` ORM object, or ``None`` if not set.
+    job
+        ``JobPosting`` ORM object.
+
+    Returns
+    -------
+    dict::
+
         {
-            "score": int (0-100),
+            "score":               int,   # 0-100 composite
+            "required_skills_met": bool,  # False → candidate missing a required skill
             "factors": {
-                "skills": int,
-                "commute": int,
-                "experience": int,
-                "certifications": int,
-                "schedule": int,
-                "industry": int,
-            }
+                "skills":               int,  # 0-100
+                "commute":              int,
+                "salary_hours":         int,
+                "interest":             int,
+                "required_skills_met":  bool,  # also stored here for DB persistence
+            },
         }
     """
-    skills      = _skills_score(candidate_skills, job.required_skills)
-    commute     = _commute_score(candidate_pref, job)
-    experience  = _experience_score(candidate_work_history, job)
-    certs       = _certifications_score(candidate_certifications, job)
-    schedule    = _schedule_score(candidate_pref, job)
-    industry    = _industry_score(candidate_work_history, job)
+    skills_ratio, required_skills_met = _skills_score(
+        candidate_skills, getattr(job, "required_skills", [])
+    )
+    commute  = _commute_score(candidate_pref, job)
+    sal_hrs  = _salary_hours_score(candidate_pref, job)
+    interest = _interest_score(candidate_pref, job)
 
     composite = (
-        skills     * 0.30
-        + commute  * 0.25
-        + experience * 0.15
-        + certs    * 0.10
-        + schedule * 0.10
-        + industry * 0.10
+        skills_ratio * 0.55
+        + commute    * 0.20
+        + sal_hrs    * 0.15
+        + interest   * 0.10
     )
 
     return {
         "score": round(composite * 100),
+        "required_skills_met": required_skills_met,
         "factors": {
-            "skills":          round(skills * 100),
-            "commute":         round(commute * 100),
-            "experience":      round(experience * 100),
-            "certifications":  round(certs * 100),
-            "schedule":        round(schedule * 100),
-            "industry":        round(industry * 100),
+            "skills":              round(skills_ratio * 100),
+            "commute":             round(commute * 100),
+            "salary_hours":        round(sal_hrs * 100),
+            "interest":            round(interest * 100),
+            "required_skills_met": required_skills_met,
         },
     }

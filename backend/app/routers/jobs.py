@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.auth import get_current_user, require_candidate, require_host_org
 from app.database import get_db
-from app.matching import calculate_match_score, MATCH_THRESHOLD
+from app.matching import calculate_match_score
 from app.models.user import Candidate, User
 from app.models.job import (
     CandidateApplication,
@@ -172,8 +172,6 @@ def compute_match(
 
     result = calculate_match_score(
         candidate_skills=candidate.skills,
-        candidate_work_history=candidate.work_history,
-        candidate_certifications=candidate.certifications,
         candidate_pref=candidate.preferences,
         job=job,
     )
@@ -370,8 +368,9 @@ def my_matches_for_fair(
     db: Session = Depends(get_db),
 ):
     """
-    Returns EC-approved matches for this candidate at the specified fair,
-    above the 60% threshold.
+    Returns all EC-approved matches for this candidate at the specified fair,
+    ordered by score descending.  All scoring tiers are shown — no minimum
+    threshold is applied.
     """
     candidate = _get_candidate(current_user, db)
     return (
@@ -379,7 +378,6 @@ def my_matches_for_fair(
         .filter(
             MatchScore.candidate_id == candidate.id,
             MatchScore.fair_id == fair_id,
-            MatchScore.score >= MATCH_THRESHOLD,
             MatchScore.ec_status == "approved",
         )
         .order_by(MatchScore.score.desc())
