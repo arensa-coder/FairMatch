@@ -32,6 +32,7 @@ from app.schemas.job import (
     JobPostingUpdate,
     MatchReviewAction,
     MatchScoreOut,
+    MatchWithJobOut,
 )
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
@@ -174,6 +175,7 @@ def compute_match(
         candidate_skills=candidate.skills,
         candidate_pref=candidate.preferences,
         job=job,
+        candidate_address=candidate.home_address,
     )
 
     # Derive fair_id from the job's fair_employer
@@ -383,6 +385,37 @@ def my_matches_for_fair(
         .order_by(MatchScore.score.desc())
         .all()
     )
+
+
+@router.get("/matches/me/{fair_id}/detailed", response_model=list[MatchWithJobOut])
+def my_matches_for_fair_detailed(
+    fair_id: uuid.UUID,
+    current_user: User = Depends(require_candidate),
+    db: Session = Depends(get_db),
+):
+    """
+    EC-approved matches for this candidate at the specified fair, with
+    embedded job details — ordered by score descending.
+    """
+    candidate = _get_candidate(current_user, db)
+    match_scores = (
+        db.query(MatchScore)
+        .filter(
+            MatchScore.candidate_id == candidate.id,
+            MatchScore.fair_id == fair_id,
+            MatchScore.ec_status == "approved",
+        )
+        .order_by(MatchScore.score.desc())
+        .all()
+    )
+
+    results = []
+    for ms in match_scores:
+        job = db.get(JobPosting, ms.job_id)
+        row = MatchWithJobOut.model_validate(ms)
+        row.job = JobPostingOut.model_validate(job) if job else None
+        results.append(row)
+    return results
 
 
 # ─── Hiring Outcomes ─────────────────────────────────────────────────────────

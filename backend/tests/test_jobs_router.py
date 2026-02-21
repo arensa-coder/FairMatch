@@ -34,6 +34,7 @@ def _make_candidate(user_id=None) -> SimpleNamespace:
     return SimpleNamespace(
         id=uuid.uuid4(),
         user_id=user_id or uuid.uuid4(),
+        home_address=None,
         skills=[],
         preferences=None,
         work_history=[],

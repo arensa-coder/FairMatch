@@ -133,6 +133,11 @@ class MatchScoreOut(AppModel):
     generated_at: datetime
 
 
+class MatchWithJobOut(MatchScoreOut):
+    """Match score with embedded job details — used by the candidate match list view."""
+    job: Optional["JobPostingOut"] = None
+
+
 class MatchReviewAction(BaseModel):
     """EC's decision on a pending match."""
     action: str  # "approved" | "declined" | "held"

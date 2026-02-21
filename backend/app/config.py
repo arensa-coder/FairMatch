@@ -39,6 +39,9 @@ class Settings(BaseSettings):
     twilio_auth_token: str = ""
     twilio_from_number: str = ""
 
+    # Google Maps (Distance Matrix API for commute scoring)
+    google_maps_api_key: str = ""
+
 
 @lru_cache
 def get_settings() -> Settings:

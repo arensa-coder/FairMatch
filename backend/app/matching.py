@@ -18,12 +18,17 @@ removed.
 """
 from __future__ import annotations
 
+import logging
 from decimal import Decimal
 from typing import TYPE_CHECKING
+
+import httpx
 
 if TYPE_CHECKING:
     from app.models.candidate import CandidateSkill, CandidatePreference
     from app.models.job import JobPosting, JobRequiredSkill
+
+log = logging.getLogger(__name__)
 
 # ── Wage normalisation to approximate annual salary ──────────────────────────
 _TO_ANNUAL: dict[str, float] = {
@@ -88,18 +93,91 @@ def _skills_score(
     return ratio, all_required_met
 
 
+_GMAPS_URL = "https://maps.googleapis.com/maps/api/distancematrix/json"
+
+
+def _duration_to_score(actual_minutes: float, max_minutes: float) -> float:
+    """1.0 if within limit; linearly decays to 0.0 at 2× the limit."""
+    if actual_minutes <= max_minutes:
+        return 1.0
+    return max(0.0, 1.0 - (actual_minutes - max_minutes) / max_minutes)
+
+
+def _gmaps_duration_minutes(
+    origin: str,
+    destination: str,
+    mode: str,
+    api_key: str,
+) -> float | None:
+    """
+    Call Google Maps Distance Matrix API and return travel time in minutes.
+    Returns None on any error (network, quota, no route).
+    """
+    try:
+        resp = httpx.get(
+            _GMAPS_URL,
+            params={
+                "origins": origin,
+                "destinations": destination,
+                "mode": mode,
+                "key": api_key,
+            },
+            timeout=5.0,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        element = data["rows"][0]["elements"][0]
+        if element.get("status") != "OK":
+            return None
+        return element["duration"]["value"] / 60.0  # seconds → minutes
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Google Maps API error (%s %s): %s", mode, destination, exc)
+        return None
+
+
 def _commute_score(
     candidate_pref: "CandidatePreference | None",
     job: "JobPosting",
+    candidate_address: str | None = None,
 ) -> float:
     """
-    1.0 for remote jobs (no commute needed).
-    Placeholder 0.5 for on-site/hybrid; Phase 2 will call the
-    Google Maps Distance Matrix API against ``candidate_pref.max_commute_*``.
+    1.0  — remote job (no commute).
+    0.0–1.0 — scored against candidate's max commute preferences via Google
+               Maps Distance Matrix API (transit and/or driving).
+    0.5  — neutral fallback when addresses or API key are missing/unavailable.
     """
     if getattr(job, "location_type", None) == "remote":
         return 1.0
-    return 0.5  # Neutral until geocoding is available
+
+    job_address = getattr(job, "job_address_text", None)
+    if not candidate_address or not job_address:
+        return 0.5  # No address data available
+
+    # Import here to avoid circular imports at module load time
+    from app.config import get_settings  # noqa: PLC0415
+    api_key = get_settings().google_maps_api_key
+    if not api_key:
+        return 0.5  # API key not configured
+
+    max_transit = getattr(candidate_pref, "max_commute_transit_minutes", None)
+    max_car = getattr(candidate_pref, "max_commute_car_minutes", None)
+
+    if not max_transit and not max_car:
+        return 0.5  # Candidate has no commute preference set
+
+    scores: list[float] = []
+
+    if max_transit:
+        mins = _gmaps_duration_minutes(candidate_address, job_address, "transit", api_key)
+        if mins is not None:
+            scores.append(_duration_to_score(mins, float(max_transit)))
+
+    if max_car:
+        mins = _gmaps_duration_minutes(candidate_address, job_address, "driving", api_key)
+        if mins is not None:
+            scores.append(_duration_to_score(mins, float(max_car)))
+
+    return sum(scores) / len(scores) if scores else 0.5
 
 
 def _salary_hours_score(
@@ -202,6 +280,7 @@ def calculate_match_score(
     candidate_skills: list,
     candidate_pref: object | None,
     job: "JobPosting",
+    candidate_address: str | None = None,
 ) -> dict:
     """
     Calculate the composite match score for a candidate↔job pair.
@@ -234,7 +313,7 @@ def calculate_match_score(
     skills_ratio, required_skills_met = _skills_score(
         candidate_skills, getattr(job, "required_skills", [])
     )
-    commute  = _commute_score(candidate_pref, job)
+    commute  = _commute_score(candidate_pref, job, candidate_address)
     sal_hrs  = _salary_hours_score(candidate_pref, job)
     interest = _interest_score(candidate_pref, job)
 
