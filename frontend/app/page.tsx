@@ -54,6 +54,21 @@ export default function Home() {
             </p>
           </div>
         </Link>
+
+        <Link href="/client" className="block w-full">
+          <div
+            className="rounded-2xl p-6 text-center transition-all hover:scale-[1.02] hover:shadow-lg cursor-pointer border-2 bg-white"
+            style={{ borderColor: "var(--gold)" }}
+          >
+            <div className="text-3xl mb-2">🧭</div>
+            <h2 className="text-xl font-bold mb-1" style={{ color: "#A07A2C", fontFamily: "var(--font-playfair)" }}>
+              Workforce Client
+            </h2>
+            <p className="text-sm" style={{ color: "#6B7280" }}>
+              Track your enrollments, career readiness, trainings, and documents
+            </p>
+          </div>
+        </Link>
       </div>
 
       <p className="mt-12 text-xs" style={{ color: "#9CA3AF" }}>
